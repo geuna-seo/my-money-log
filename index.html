@@ -210,6 +210,24 @@
   footer { display: flex; justify-content: center; gap: 8px; margin-top: 22px; }
   footer button { border: none; background: none; color: var(--muted); font-size: 13px; cursor: pointer; padding: 6px 10px; text-decoration: underline; text-underline-offset: 3px; }
 
+  dialog {
+    border: none; border-radius: 24px; padding: 24px; width: min(420px, calc(100% - 32px));
+    background: var(--surface); color: var(--text); box-shadow: 0 20px 60px rgba(0,0,0,.25);
+  }
+  dialog::backdrop { background: rgba(10,10,14,.45); backdrop-filter: blur(3px); }
+  dialog h3 { margin: 0 0 8px; font-size: 19px; }
+  dialog p { margin: 0 0 16px; font-size: 13px; color: var(--muted); line-height: 1.6; }
+  dialog label { display: block; font-size: 13px; font-weight: 600; margin: 18px 0 6px; }
+  dialog input {
+    width: 100%; border: none; background: var(--surface-2); border-radius: 14px;
+    padding: 13px 14px; font-size: 13px; outline: none; margin-bottom: 16px; font-family: ui-monospace, Consolas, monospace;
+  }
+  dialog input:focus { box-shadow: inset 0 0 0 1.5px var(--text); }
+  .code-box { display: flex; align-items: center; gap: 8px; background: var(--surface-2); border-radius: 14px; padding: 10px 10px 10px 14px; }
+  .code-box code { flex: 1; min-width: 0; font-size: 12.5px; word-break: break-all; font-family: ui-monospace, Consolas, monospace; }
+  .code-box button { border: none; border-radius: 10px; padding: 8px 12px; background: var(--text); color: var(--bg); font-weight: 600; font-size: 13px; cursor: pointer; flex-shrink: 0; }
+  .btn:disabled { opacity: .55; cursor: wait; }
+
   .toast {
     position: fixed; left: 50%; bottom: 28px; transform: translate(-50%, 20px); opacity: 0;
     background: var(--text); color: var(--bg); padding: 12px 20px; border-radius: 999px; font-size: 14px; font-weight: 600;
@@ -227,7 +245,10 @@
 <div class="wrap">
   <header>
     <div class="logo">my money log<i></i></div>
-    <button class="icon-btn" id="themeBtn" aria-label="테마 전환">🌙</button>
+    <div style="display:flex;gap:8px">
+      <button class="icon-btn" id="codeBtn" aria-label="장부 코드" title="장부 코드 · 기기 연결">🔑</button>
+      <button class="icon-btn" id="themeBtn" aria-label="테마 전환">🌙</button>
+    </div>
   </header>
 
   <div class="layout">
@@ -304,6 +325,19 @@
 </div>
 <div class="toast" id="toast"></div>
 
+<dialog id="codeDialog">
+  <h3>장부 코드 🔑</h3>
+  <p>이 코드를 다른 기기에 입력하면 같은 장부를 함께 쓸 수 있어요.<br>코드를 아는 사람은 누구나 내역을 보고 고칠 수 있으니 남에게 알려주지 마세요.</p>
+  <div class="code-box"><code id="myCode"></code><button type="button" id="copyCode">복사</button></div>
+  <label for="codeInput">다른 기기의 장부 코드로 연결</label>
+  <input id="codeInput" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off" spellcheck="false">
+  <div class="btn-row">
+    <button type="button" class="btn ghost" id="closeCode">닫기</button>
+    <button type="button" class="btn" id="applyCode">연결하기</button>
+  </div>
+</dialog>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <script>
   const CATEGORIES = {
     expense: [
@@ -313,10 +347,50 @@
     income: [["월급", "💼"], ["용돈", "🎁"], ["부수입", "💸"], ["기타", "✨"]]
   };
   const COLORS = ["#ff5a5f", "#ffb547", "#c8f169", "#3a7bff", "#a77bff", "#2ed3b7", "#ff7ac6", "#8b8a92"];
-  const STORAGE_KEY = "simple-ledger-items";
+  const OLD_STORAGE_KEY = "simple-ledger-items"; // 예전 localStorage 저장분 (자동 이전용)
   const THEME_KEY = "simple-ledger-theme";
+  const LEDGER_KEY = "simple-ledger-id";
 
-  let items = load();
+  /* Supabase 설정 — publishable 키는 브라우저에 공개돼도 되는 키입니다.
+     실제 접근 제어는 DB의 RLS 정책(장부 코드 일치 여부)이 담당합니다. */
+  const SUPABASE_URL = "https://ldpdhcodqeljumsagudo.supabase.co";
+  const SUPABASE_KEY = "sb_publishable_aL3FBe_KZVaKHLjuD5bwXg_U11yZffZ";
+  const TABLE = "ledger_entries";
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  // 무작위 장부 코드(UUID v4). randomUUID는 https에서만 되므로 getRandomValues로 대체 생성
+  function newUuid() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    const b = crypto.getRandomValues(new Uint8Array(16));
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const h = [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+  }
+  function getLedgerId() {
+    let id = null;
+    try { id = localStorage.getItem(LEDGER_KEY); } catch {}
+    if (!id || !UUID_RE.test(id)) {
+      id = newUuid();
+      try { localStorage.setItem(LEDGER_KEY, id); } catch {}
+    }
+    return id.toLowerCase();
+  }
+  const ledgerId = getLedgerId();
+  const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: { persistSession: false },
+    global: { headers: { "x-ledger-id": ledgerId } }
+  });
+  const fromRow = (r) => ({
+    id: r.id, type: r.type, date: r.entry_date, category: r.category,
+    amount: Number(r.amount), memo: r.memo || "", createdAt: r.created_at
+  });
+  const toRow = (d) => ({
+    ledger_id: ledgerId, type: d.type, entry_date: d.date, category: d.category, amount: d.amount, memo: d.memo
+  });
+
+  let items = [];
+  let loading = true;
   let editingId = null;
   let filter = "all";
   let category = null;
@@ -334,12 +408,31 @@
   const esc = (s) => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const emojiOf = (type, cat) => (CATEGORIES[type].find(c => c[0] === cat) || [, "✨"])[1];
 
-  function load() {
-    try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; } catch { return []; }
+  /* DB에서 불러오기 (+ 예전 브라우저 저장분이 있으면 한 번 옮기기) */
+  async function migrateLocal() {
+    let old = [];
+    try { old = JSON.parse(localStorage.getItem(OLD_STORAGE_KEY)) || []; } catch { return; }
+    const rows = old
+      .filter(i => i && (i.type === "income" || i.type === "expense") && /^\d{4}-\d{2}-\d{2}$/.test(i.date) && i.amount > 0)
+      .map(i => toRow({ type: i.type, date: i.date, category: String(i.category || "기타").slice(0, 20),
+                        amount: Math.round(i.amount), memo: String(i.memo || "").slice(0, 100) }));
+    if (!rows.length) { try { localStorage.removeItem(OLD_STORAGE_KEY); } catch {} return; }
+    const { error } = await db.from(TABLE).insert(rows);
+    if (error) { console.error(error); return; }
+    try { localStorage.removeItem(OLD_STORAGE_KEY); } catch {}
+    toast(`기존 기록 ${rows.length}건을 옮겼어요 📦`);
   }
-  function save() {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(items)); } catch {}
+  async function loadAll() {
+    loading = true; render();
+    await migrateLocal();
+    const { data, error } = await db.from(TABLE).select("*")
+      .order("entry_date", { ascending: true }).order("created_at", { ascending: true });
+    loading = false;
+    if (error) { console.error(error); toast("기록을 불러오지 못했어요 😢"); }
+    else items = data.map(fromRow);
+    render();
   }
+
   function toast(msg) {
     const t = $("toast");
     t.textContent = msg; t.classList.add("show");
@@ -407,8 +500,10 @@
       ? `${Number(selectedDay.slice(5, 7))}월 ${Number(selectedDay.slice(8))}일 내역<button class="clear-day" aria-label="날짜 선택 해제">✕ 전체</button>`
       : "내역";
     const shown = m.filter(i => (filter === "all" || i.type === filter) && (!selectedDay || i.date === selectedDay))
-      .sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id);
-    if (!shown.length) {
+      .sort((a, b) => b.date.localeCompare(a.date) || (b.createdAt || "").localeCompare(a.createdAt || ""));
+    if (loading) {
+      $("list").innerHTML = `<div class="empty"><div>⏳</div>불러오는 중…</div>`;
+    } else if (!shown.length) {
       $("list").innerHTML = `<div class="empty"><div>🫥</div>${selectedDay ? "이 날은 기록이 없어요" : "아직 기록이 없어요"}</div>`;
     } else {
       const days = ["일", "월", "화", "수", "목", "금", "토"];
@@ -522,36 +617,51 @@
     $("cancelBtn").hidden = true;
   }
 
-  $("form").addEventListener("submit", (e) => {
+  $("form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const amount = Number($("amount").value.replace(/\D/g, ""));
     if (!amount) { toast("금액을 입력해 주세요 💬"); $("amount").focus(); return; }
+    if (!$("date").value) { toast("날짜를 골라 주세요 📅"); return; }
     const data = { type: getType(), date: $("date").value, category, amount, memo: $("memo").value.trim() };
+
+    const btn = $("submitBtn");
+    btn.disabled = true;
+    const query = editingId
+      ? db.from(TABLE).update(toRow(data)).eq("id", editingId)
+      : db.from(TABLE).insert(toRow(data));
+    const { data: row, error } = await query.select().single();
+    btn.disabled = false;
+    if (error) { console.error(error); toast("저장하지 못했어요. 잠시 후 다시 시도해 주세요 😢"); return; }
+
+    const saved = fromRow(row);
     if (editingId) {
-      Object.assign(items.find(i => i.id === editingId), data);
+      items = items.map(i => i.id === saved.id ? saved : i);
       toast("수정했어요 ✏️");
     } else {
-      items.push({ id: Date.now(), ...data });
+      items.push(saved);
       toast(data.type === "income" ? "수입을 기록했어요 💙" : "지출을 기록했어요 🧾");
     }
     viewYear = Number(data.date.slice(0, 4));
     viewMonth = Number(data.date.slice(5, 7)) - 1;
     if (selectedDay && selectedDay !== data.date) selectedDay = null;
-    save(); resetForm(); render();
+    resetForm(); render();
   });
   $("cancelBtn").addEventListener("click", resetForm);
 
   /* 더보기 메뉴 (수정/삭제) */
   function closeMenu() { document.querySelectorAll(".menu").forEach(m => m.remove()); }
-  document.addEventListener("click", (e) => {
+  document.addEventListener("click", async (e) => {
     const more = e.target.closest(".more");
     const action = e.target.closest(".menu button");
     if (action) {
-      const id = Number(action.dataset.id);
+      const id = action.dataset.id;
       if (action.dataset.act === "del") {
+        closeMenu();
+        const { error } = await db.from(TABLE).delete().eq("id", id);
+        if (error) { console.error(error); toast("삭제하지 못했어요 😢"); return; }
         items = items.filter(i => i.id !== id);
         if (editingId === id) resetForm();
-        save(); render(); toast("삭제했어요 🗑️");
+        render(); toast("삭제했어요 🗑️");
       } else {
         const it = items.find(i => i.id === id);
         editingId = id;
@@ -606,13 +716,35 @@
     a.click();
     URL.revokeObjectURL(a.href);
   });
-  $("clearBtn").addEventListener("click", () => {
-    if (!confirm("모든 기록을 지울까요? 되돌릴 수 없어요.")) return;
-    items = []; selectedDay = null; save(); resetForm(); render(); toast("모두 지웠어요");
+  $("clearBtn").addEventListener("click", async () => {
+    if (!confirm("이 장부의 모든 기록을 지울까요? 같은 장부 코드를 쓰는 다른 기기에서도 사라지고, 되돌릴 수 없어요.")) return;
+    const { error } = await db.from(TABLE).delete().eq("ledger_id", ledgerId);
+    if (error) { console.error(error); toast("지우지 못했어요 😢"); return; }
+    items = []; selectedDay = null; resetForm(); render(); toast("모두 지웠어요");
+  });
+
+  /* 장부 코드 (기기 연결) */
+  $("codeBtn").addEventListener("click", () => {
+    $("myCode").textContent = ledgerId;
+    $("codeInput").value = "";
+    $("codeDialog").showModal();
+  });
+  $("closeCode").addEventListener("click", () => $("codeDialog").close());
+  $("copyCode").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(ledgerId); toast("장부 코드를 복사했어요 📋"); }
+    catch { toast("복사하지 못했어요. 직접 선택해서 복사해 주세요"); }
+  });
+  $("applyCode").addEventListener("click", () => {
+    const code = $("codeInput").value.trim().toLowerCase();
+    if (!UUID_RE.test(code)) { toast("장부 코드 형식이 올바르지 않아요"); return; }
+    if (code === ledgerId) { toast("이미 이 장부를 쓰고 있어요"); return; }
+    if (!confirm("이 기기를 입력한 장부로 바꿀까요?\n지금 장부 코드를 따로 적어두지 않으면 지금 장부로 돌아올 수 없어요.")) return;
+    try { localStorage.setItem(LEDGER_KEY, code); } catch { toast("이 브라우저에서는 코드를 저장할 수 없어요"); return; }
+    location.reload();
   });
 
   resetForm();
-  render();
+  loadAll();
 </script>
 </body>
 </html>
