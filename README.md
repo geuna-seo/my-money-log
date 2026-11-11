@@ -4,7 +4,9 @@ DB도, 회원가입도 필요 없는 간단한 가계부 웹페이지입니다. 
 
 ## 사용법
 
-`index.html`을 브라우저로 열면 바로 쓸 수 있습니다.
+👉 **바로 사용하기: https://geuna-seo.github.io/my-money-log/**
+
+또는 `index.html`을 내려받아 브라우저로 열어도 됩니다.
 
 ## 기능
 
